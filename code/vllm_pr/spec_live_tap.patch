@@ -1,0 +1,1330 @@
+From 3b6dd374b36387dc5ba8251e09c7cd073fae48bb Mon Sep 17 00:00:00 2001
+From: Tony Wen <jwen2914@uni.sydney.edu.au>
+Date: Thu, 8 Oct 2026 16:58:43 +1100
+Subject: [PATCH 1/9] [Spec Decode] Export live EAGLE-3 training data through a
+ shared-memory ring
+
+Add an opt-in tap (VLLM_SPEC_LIVE_TAP=<path>) that streams, for every
+committed position of every request, the target token id and the
+auxiliary hidden states the EAGLE-3 drafter already consumes, into a
+shared-memory ring buffer. A co-located trainer can keep the draft model
+adapted to the traffic actually being served and reload it with
+reload_draft_weights, without recomputing target forwards.
+
+The model runner issues one non-blocking D2H copy per step into a pinned
+staging buffer in the EAGLE branch of propose_draft_token_ids (rejected
+draft positions are dropped using num_rejected_tokens) and a background
+thread writes per-request chunks; finished request ids are forwarded
+from _update_states. Only TP rank 0 writes; the tap disables itself on
+any error so it can never take serving down. Measured cost with a
+Qwen3-8B target at 256 concurrent requests: ~1.4% throughput.
+
+Co-authored-by: Claude <noreply@anthropic.com>
+Signed-off-by: Tony Wen <jwen2914@uni.sydney.edu.au>
+---
+ docs/features/speculative_decoding/eagle.md |  28 ++
+ tests/v1/worker/test_live_tap.py            | 155 ++++++++
+ vllm/v1/spec_decode/live_tap.py             | 416 ++++++++++++++++++++
+ vllm/v1/worker/gpu_model_runner.py          |  22 ++
+ 4 files changed, 621 insertions(+)
+ create mode 100644 tests/v1/worker/test_live_tap.py
+ create mode 100644 vllm/v1/spec_decode/live_tap.py
+
+diff --git a/docs/features/speculative_decoding/eagle.md b/docs/features/speculative_decoding/eagle.md
+index cc9e4fd..a840592 100644
+--- a/docs/features/speculative_decoding/eagle.md
++++ b/docs/features/speculative_decoding/eagle.md
+@@ -65,3 +65,31 @@ A variety of EAGLE draft models are available on the Hugging Face hub:
+ 
+ !!! warning
+     If you are using `vllm<0.7.0`, please use [this script](https://gist.github.com/abhigoyal1997/1e7a4109ccb7704fbc67f625e86b2d6d) to convert the speculative model and specify `"model": "path/to/modified/eagle/model"` in `speculative_config`.
++
++## Exporting Live Training Data for the Draft Model
++
++EAGLE-3 heads are trained on the target model's auxiliary hidden states, which the
++engine already computes for every committed token. Setting `VLLM_SPEC_LIVE_TAP`
++makes the model runner stream the `(token id, aux hidden state)` pairs of every
++committed position, per request, into a shared-memory ring buffer so that a
++co-located training process can keep the draft model adapted to the traffic
++actually being served (and reload it with `reload_draft_weights`):
++
++```bash
++VLLM_SPEC_LIVE_TAP=/dev/shm/draft_tap \
++VLLM_SPEC_LIVE_TAP_GB=4 \
++vllm serve Qwen/Qwen3-8B --no-enable-prefix-caching \
++    --speculative-config '{"method": "eagle3", "model": "AngelSlim/Qwen3-8B_eagle3", "num_speculative_tokens": 3}'
++```
++
++* `VLLM_SPEC_LIVE_TAP_GB` sizes the ring (default 4 GiB); when the reader falls
++  behind, the oldest records are overwritten, so the newest traffic always wins.
++* `VLLM_SPEC_LIVE_TAP_RATE` samples a fraction of the requests (default 1.0).
++* The device-to-host copy is non-blocking and the file is written by a background
++  thread; with a Qwen3-8B target at full load the export costs about 1-2% of
++  throughput. Only tensor-parallel rank 0 writes.
++* Prefix caching must be disabled: positions served from the prefix cache have no
++  hidden state to export.
++
++The record format is documented in `vllm/v1/spec_decode/live_tap.py`; `Ring` in
++the same module is the reader side.
+diff --git a/tests/v1/worker/test_live_tap.py b/tests/v1/worker/test_live_tap.py
+new file mode 100644
+index 0000000..51b091a
+--- /dev/null
++++ b/tests/v1/worker/test_live_tap.py
+@@ -0,0 +1,155 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Unit tests for the speculative-decoding live training-data tap."""
++
++import os
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import numpy as np
++import pytest
++import torch
++
++from vllm.v1.spec_decode.live_tap import (
++    CHUNK_HDR,
++    K_CHUNK,
++    K_FINISH,
++    K_GAP,
++    LiveTap,
++    Ring,
++    _id_payload,
++    decode_chunk,
++    decode_id,
++)
++
++
++def _chunk(rid: str, start: int, plen: int, tok: np.ndarray, aux: np.ndarray):
++    rb = rid.encode()
++    hdr = (
++        CHUNK_HDR.pack(len(rb), len(tok), start, plen, aux.shape[1], 0)
++        + rb
++        + bytes((-len(rb)) % 8)
++    )
++    return [
++        np.frombuffer(hdr, dtype=np.uint8),
++        tok.view(np.uint8).reshape(-1),
++        aux.reshape(-1).view(np.uint8),
++    ]
++
++
++def test_ring_roundtrip_wrap_and_lap(tmp_path):
++    path = str(tmp_path / "ring")
++    w = Ring(path, capacity=64 * 1024, create=True)
++    r = Ring(path)
++    hidden = 48
++    got = []
++    # ~600 KB of records through a 64 KB ring: wraps many times, reader keeps up
++    for i in range(300):
++        tok = np.arange(i, i + 20, dtype=np.int32)
++        aux = np.full((20, hidden), i, dtype=np.int16)
++        assert w.write(K_CHUNK, _chunk(f"req-{i}", 0, 5, tok, aux))
++        assert w.write(K_FINISH, _id_payload(f"req-{i}"))
++        if i % 7 == 0:
++            got.extend(r.read())
++    got.extend(r.read())
++    assert r.lapped == 0
++    chunks = [decode_chunk(p) for k, p in got if k == K_CHUNK]
++    fins = [decode_id(p) for k, p in got if k == K_FINISH]
++    assert len(chunks) == 300 and len(fins) == 300
++    for i, (rid, n, start, plen, hid, tok, aux) in enumerate(chunks):
++        assert (rid, n, start, plen, hid) == (f"req-{i}", 20, 0, 5, hidden)
++        assert tok.tolist() == list(range(i, i + 20))
++        assert int(aux[3, 7]) == i
++        assert fins[i] == rid
++    # a reader that falls behind is lapped and resynchronises at the oldest record
++    slow = Ring(path)
++    slow.rewind_to_oldest()
++    for i in range(300, 600):
++        w.write(
++            K_CHUNK,
++            _chunk(
++                f"req-{i}",
++                0,
++                5,
++                np.zeros(20, np.int32),
++                np.zeros((20, hidden), np.int16),
++            ),
++        )
++    out = list(slow.read(max_records=10_000))
++    assert slow.lapped >= 1 and slow.rseq == w.write_seq
++    assert all(k == K_CHUNK for k, _ in out)
++
++
++def test_from_env_disabled_without_variable():
++    with patch.dict(os.environ, {}, clear=False):
++        os.environ.pop(LiveTap.ENV, None)
++        assert (
++            LiveTap.from_env(SimpleNamespace(max_num_tokens=8, max_num_reqs=2)) is None
++        )
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
++def test_record_exports_committed_positions(tmp_path):
++    """Two requests in a padded batch: request A has 4 scheduled tokens of which the
++    last 2 are rejected drafts, request B is a 3-token prefill chunk. Only the
++    committed positions must reach the ring, in request order, with the right
++    start positions; the finish marker follows."""
++    path = str(tmp_path / "tap")
++    tap = LiveTap(
++        path, 1 << 20, 1.0, max_tokens=16, max_reqs=4, pool=2, log=lambda *_: None
++    )
++    tap._tp = True
++    hidden = 6
++    tokens = torch.arange(7, dtype=torch.int32, device="cuda")
++    hs = (
++        torch.arange(7 * hidden, dtype=torch.float32, device="cuda")
++        .view(7, hidden)
++        .to(torch.bfloat16)
++    )
++    rejected = torch.tensor([2, 0], dtype=torch.int32, device="cuda")
++    input_batch = SimpleNamespace(
++        num_reqs=2,
++        req_ids=["A", "B"],
++        num_computed_tokens_cpu=np.array([10, 0], dtype=np.int32),
++    )
++    scheduler_output = SimpleNamespace(num_scheduled_tokens={"A": 4, "B": 3})
++    requests = {
++        "A": SimpleNamespace(num_prompt_tokens=5),
++        "B": SimpleNamespace(num_prompt_tokens=3),
++    }
++    tap.record(
++        scheduler_output,
++        input_batch,
++        requests,
++        tokens,
++        hs,
++        num_rejected_gpu=rejected,
++        num_draft_tokens=[3, 0],
++    )
++    tap.finish(["A"])
++    tap.q.join() if hasattr(tap.q, "join") else None
++    reader = Ring(path)
++    reader.rewind_to_oldest()
++    deadline = 50
++    got = []
++    while len(got) < 3 and deadline:
++        got.extend(reader.read())
++        deadline -= 1
++        if len(got) < 3:
++            import time
++
++            time.sleep(0.05)
++    kinds = [k for k, _ in got]
++    assert kinds == [K_CHUNK, K_CHUNK, K_FINISH]
++    rid, n, start, plen, hid, tok, aux = decode_chunk(got[0][1])
++    assert (rid, n, start, plen, hid) == ("A", 2, 10, 5, hidden)
++    assert tok.tolist() == [0, 1]
++    assert aux.view(np.int16).shape == (2, hidden)
++    expect = hs[:2].view(torch.int16).cpu().numpy()
++    assert np.array_equal(aux, expect)
++    rid, n, start, plen, hid, tok, aux = decode_chunk(got[1][1])
++    assert (rid, n, start, plen) == ("B", 3, 0, 3)
++    assert tok.tolist() == [4, 5, 6]
++    assert decode_id(got[2][1]) == "A"
++    assert tap.dropped == 0
++    assert K_GAP not in kinds
+diff --git a/vllm/v1/spec_decode/live_tap.py b/vllm/v1/spec_decode/live_tap.py
+new file mode 100644
+index 0000000..adf86d4
+--- /dev/null
++++ b/vllm/v1/spec_decode/live_tap.py
+@@ -0,0 +1,416 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Live training-data tap for speculative decoding (EAGLE-3).
++
++The serving engine streams the (token id, aux hidden state) pairs of every
++committed position into a shared-memory ring buffer; a co-located trainer
++consumes them as requests complete. One writer (the model runner, TP rank 0),
++one reader.
++
++File layout (default /dev/shm):
++  header 4096 B : u64 magic, u64 capacity, u64 write_seq, u64 oldest_seq,
++                  u32 hidden, u32 dropped_steps
++  data capacity : records at offset seq % capacity; a record never straddles
++                  the wrap (a PAD record fills the tail)
++  record        : u32 kind, u32 payload_len, u64 seq, payload (padded to 16 B)
++    CHUNK  : u32 id_len, u32 n, u32 start_pos, u32 prompt_len, u32 hidden,
++             u32 flags, req_id (padded to 8), int32 tokens[n],
++             int16 aux[n * hidden] (bf16 bit patterns); the rows cover
++             positions start_pos .. start_pos + n - 1 of the request
++    FINISH : u32 id_len, u32 pad, req_id   -- the request is complete
++    GAP    : same as FINISH                -- a step was dropped: discard it
++`seq` is a logical byte offset that only grows; `oldest_seq` is the start of
++the oldest intact record, so a reader that falls behind it has been lapped and
++resynchronises there (newest data wins, by design).
++"""
++
++import contextlib
++import os
++import queue
++import struct
++import threading
++import time
++import zlib
++from collections import deque
++
++import numpy as np
++
++HDR = 4096
++MAGIC = 0x4C49564554415031
++REC = 16
++K_CHUNK, K_FINISH, K_PAD, K_GAP = 1, 2, 3, 4
++CHUNK_HDR = struct.Struct("<IIIIII")
++ID_HDR = struct.Struct("<II")
++
++
++def _r16(x):
++    return (x + 15) & ~15
++
++
++def _id_payload(rid):
++    b = rid.encode()
++    raw = ID_HDR.pack(len(b), 0) + b + bytes((-len(b)) % 8)
++    return [np.frombuffer(raw, dtype=np.uint8)]
++
++
++def decode_id(payload):
++    n, _ = ID_HDR.unpack_from(payload, 0)
++    return payload[ID_HDR.size : ID_HDR.size + n].decode()
++
++
++def decode_chunk(payload):
++    """-> (req_id, n, start_pos, prompt_len, hidden, tokens int32[n],
++    aux int16[n, hidden]); the arrays are views into payload."""
++    id_len, n, start, plen, hidden, _flags = CHUNK_HDR.unpack_from(payload, 0)
++    o = CHUNK_HDR.size
++    rid = payload[o : o + id_len].decode()
++    o += id_len + (-id_len) % 8
++    tok = np.frombuffer(payload, dtype=np.int32, count=n, offset=o)
++    o += 4 * n
++    aux = np.frombuffer(payload, dtype=np.int16, count=n * hidden, offset=o)
++    return rid, n, start, plen, hidden, tok, aux.reshape(n, hidden)
++
++
++class Ring:
++    def __init__(self, path, capacity=0, create=False):
++        if create:
++            cap = _r16(int(capacity))
++            with open(path, "wb") as f:
++                f.truncate(HDR + cap)
++            self.mm = np.memmap(path, dtype=np.uint8, mode="r+")
++            self._u64(1, cap)
++            self._u64(2, 0)
++            self._u64(3, 0)
++            self._u64(0, MAGIC)
++        else:
++            self.mm = np.memmap(path, dtype=np.uint8, mode="r")
++            if self._u64(0) != MAGIC:
++                raise ValueError(f"{path}: not a live-tap ring")
++        self.cap = int(self._u64(1))
++        # writer: (seq, length) of the records still intact, oldest first
++        self.live = deque()
++        # reader: start from "now"
++        self.rseq = self._u64(2)
++        self.lapped = 0
++        self.records = 0
++        self.nbytes = 0
++
++    def _u64(self, i, v=None):
++        a = self.mm[i * 8 : (i + 1) * 8].view(np.uint64)
++        if v is None:
++            return int(a[0])
++        a[0] = v
++
++    def _u32(self, off, v=None):
++        a = self.mm[off : off + 4].view(np.uint32)
++        if v is None:
++            return int(a[0])
++        a[0] = v
++
++    @property
++    def write_seq(self):
++        return self._u64(2)
++
++    @property
++    def oldest_seq(self):
++        return self._u64(3)
++
++    # ------------------------------------------------------------- writer
++    def _hdr(self, pos, kind, plen, seq):
++        raw = struct.pack("<IIQ", kind, plen, seq)
++        self.mm[HDR + pos : HDR + pos + REC] = np.frombuffer(raw, dtype=np.uint8)
++
++    def _evict(self, start, length):
++        lo = start + length - self.cap
++        while self.live and self.live[0][0] < lo:
++            self.live.popleft()
++        self._u64(3, self.live[0][0] if self.live else start)
++
++    def write(self, kind, parts):
++        """parts: list of 1-D np.uint8 arrays. False if the record cannot fit."""
++        plen = sum(int(p.nbytes) for p in parts)
++        rec = REC + _r16(plen)
++        if rec > self.cap:
++            return False
++        w = self._u64(2)
++        pos = w % self.cap
++        if self.cap - pos < rec:
++            padlen = self.cap - pos
++            self._evict(w, padlen)
++            self._hdr(pos, K_PAD, padlen - REC, w)
++            self.live.append((w, padlen))
++            w += padlen
++            pos = 0
++            self._u64(2, w)
++        self._evict(w, rec)
++        self._hdr(pos, kind, plen, w)
++        o = HDR + pos + REC
++        for p in parts:
++            n = int(p.nbytes)
++            self.mm[o : o + n] = p
++            o += n
++        self.live.append((w, rec))
++        self._u64(2, w + rec)
++        self.records += 1
++        self.nbytes += rec
++        return True
++
++    # ------------------------------------------------------------- reader
++    def rewind_to_oldest(self):
++        self.rseq = self._u64(3)
++
++    def read(self, max_records=1000):
++        """Yield (kind, payload bytes) for the records written since the
++        previous call."""
++        w = self._u64(2)
++        o = self._u64(3)
++        if self.rseq < o:
++            self.lapped += 1
++            self.rseq = o
++        n = 0
++        while self.rseq < w and n < max_records:
++            pos = self.rseq % self.cap
++            raw = bytes(self.mm[HDR + pos : HDR + pos + REC])
++            kind, plen, seq = struct.unpack("<IIQ", raw)
++            if seq != self.rseq:
++                self.lapped += 1
++                self.rseq = self._u64(3)
++                continue
++            rec = REC + _r16(plen)
++            start = HDR + pos + REC
++            payload = bytes(self.mm[start : start + plen]) if kind != K_PAD else b""
++            if self._u64(3) > self.rseq:  # overwritten while we were copying it
++                self.lapped += 1
++                self.rseq = self._u64(3)
++                continue
++            self.rseq += rec
++            n += 1
++            if kind != K_PAD:
++                self.records += 1
++                yield kind, payload
++
++
++class LiveTap:
++    """Runner-side exporter.
++
++    `record` is called once per step from the EAGLE branch with the gathered
++    target token ids / hidden states; the D2H copy is issued non-blocking on
++    the current stream into a pinned staging buffer, and a background thread
++    writes per-request chunks once the copy has landed."""
++
++    ENV = "VLLM_SPEC_LIVE_TAP"
++
++    def __init__(self, path, capacity, rate, max_tokens, max_reqs, pool=3, log=print):
++        self.path, self.capacity, self.rate = path, int(capacity), float(rate)
++        self.max_tokens, self.max_reqs = int(max_tokens), int(max_reqs)
++        self.pool = int(pool)
++        self.log = log
++        self.ring = None
++        self.bufs = []
++        self.free = queue.Queue()
++        self.q = queue.Queue()
++        self.dropped = 0
++        self.steps = 0
++        self.disabled = False
++        self._tp = None
++        self._t_log = time.time()
++        self.thread = None
++
++    @classmethod
++    def from_env(cls, runner, log=print):
++        path = os.environ.get(cls.ENV)
++        if not path:
++            return None
++        cap = float(os.environ.get(cls.ENV + "_GB", "4")) * (1 << 30)
++        rate = float(os.environ.get(cls.ENV + "_RATE", "1"))
++        tap = cls(
++            path,
++            cap,
++            rate,
++            getattr(runner, "max_num_tokens", 16384),
++            getattr(runner, "max_num_reqs", 1024),
++            log=log,
++        )
++        log(
++            f"[live-tap] configured: path={path} "
++            f"capacity={cap / 2**30:.1f}GB rate={rate}"
++        )
++        return tap
++
++    def _is_writer(self):
++        if self._tp is None:
++            try:
++                from vllm.distributed.parallel_state import (
++                    get_tensor_model_parallel_rank,
++                )
++
++                self._tp = get_tensor_model_parallel_rank() == 0
++            except Exception:
++                self._tp = True
++        return self._tp
++
++    def _ensure(self, hidden):
++        import torch
++
++        if self.bufs:
++            return
++        for i in range(self.pool):
++            self.bufs.append(
++                dict(
++                    tok=torch.empty(
++                        self.max_tokens, dtype=torch.int32, pin_memory=True
++                    ),
++                    aux=torch.empty(
++                        self.max_tokens, hidden, dtype=torch.int16, pin_memory=True
++                    ),
++                    rej=torch.zeros(self.max_reqs, dtype=torch.int32, pin_memory=True),
++                )
++            )
++            self.free.put(i)
++        if os.path.exists(self.path):
++            os.remove(self.path)
++        self.ring = Ring(self.path, self.capacity, create=True)
++        self.ring._u32(32, hidden)
++        self.thread = threading.Thread(target=self._loop, name="live-tap", daemon=True)
++        self.thread.start()
++        self.log(
++            f"[live-tap] ring created: hidden={hidden} "
++            f"pool={self.pool}x{self.max_tokens} tokens"
++        )
++
++    def _tapped(self, rid):
++        return self.rate >= 1.0 or (zlib.crc32(rid.encode()) % 10000) < (
++            self.rate * 10000
++        )
++
++    def record(
++        self,
++        scheduler_output,
++        input_batch,
++        requests,
++        token_ids,
++        hidden_states,
++        num_rejected_gpu=None,
++        num_draft_tokens=None,
++        compact_query_start_loc_cpu=None,
++    ):
++        """token_ids [T], hidden_states [T, hidden] in the batch's token layout
++        (the rows of request i are contiguous, in input_batch order). With
++        compact_query_start_loc_cpu (padded drafter batch disabled) the layout
++        already excludes rejected tokens; otherwise each request's chunk has
++        scheduler_output.num_scheduled_tokens rows of which the last
++        num_rejected_gpu[i] are rejected drafts."""
++        if self.disabled or not self._is_writer():
++            return
++        try:
++            import torch
++
++            T = int(token_ids.shape[0])
++            if T == 0:
++                return
++            if hidden_states.element_size() != 2:
++                hidden_states = hidden_states.to(torch.bfloat16)
++            self._ensure(int(hidden_states.shape[-1]))
++            num_reqs = input_batch.num_reqs
++            req_ids = list(input_batch.req_ids[:num_reqs])
++            if compact_query_start_loc_cpu is not None:
++                qsl = compact_query_start_loc_cpu.numpy()[: num_reqs + 1]
++                qlens = np.diff(qsl).astype(np.int64)
++                nd = None
++            else:
++                qlens = np.array(
++                    [scheduler_output.num_scheduled_tokens[r] for r in req_ids],
++                    dtype=np.int64,
++                )
++                nd = list(num_draft_tokens) if num_draft_tokens is not None else None
++            starts = np.array(
++                input_batch.num_computed_tokens_cpu[:num_reqs], dtype=np.int64
++            )
++            plens = [
++                int(getattr(requests[r], "num_prompt_tokens", 0) or 0) for r in req_ids
++            ]
++            try:
++                i = self.free.get_nowait()
++            except queue.Empty:
++                self.dropped += 1
++                self.q.put(("gap", req_ids))
++                return
++            b = self.bufs[i]
++            b["tok"][:T].copy_(token_ids, non_blocking=True)
++            b["aux"][:T].copy_(hidden_states.view(torch.int16), non_blocking=True)
++            has_rej = (
++                num_rejected_gpu is not None and compact_query_start_loc_cpu is None
++            )
++            if has_rej:
++                b["rej"][:num_reqs].copy_(num_rejected_gpu, non_blocking=True)
++            ev = torch.cuda.Event()
++            ev.record()
++            self.steps += 1
++            self.q.put(("step", i, ev, T, req_ids, qlens, starts, plens, nd, has_rej))
++        except Exception as e:  # never let the tap take the server down
++            self.disabled = True
++            self.log(f"[live-tap] disabled after error: {e!r}")
++
++    def finish(self, req_ids):
++        if self.ring is not None and not self.disabled:
++            self.q.put(("finish", list(req_ids)))
++
++    def _loop(self):
++        while True:
++            it = self.q.get()
++            if it is None:
++                return
++            try:
++                if it[0] == "finish":
++                    for r in it[1]:
++                        self.ring.write(K_FINISH, _id_payload(r))
++                    continue
++                if it[0] == "gap":
++                    for r in it[1]:
++                        self.ring.write(K_GAP, _id_payload(r))
++                    continue
++                _, i, ev, T, req_ids, qlens, starts, plens, nd, has_rej = it
++                ev.synchronize()
++                b = self.bufs[i]
++                tok = b["tok"][:T].numpy()
++                aux = b["aux"][:T].numpy()
++                rej = b["rej"][: len(req_ids)].numpy() if has_rej else None
++                hidden = aux.shape[1]
++                off = 0
++                for j, rid in enumerate(req_ids):
++                    q = int(qlens[j])
++                    v = q
++                    if rej is not None and (nd is None or nd[j] > 0):
++                        v = q - int(rej[j])
++                    v = max(0, min(q, v))
++                    if v > 0 and self._tapped(rid):
++                        rb = rid.encode()
++                        hdr = (
++                            CHUNK_HDR.pack(
++                                len(rb), v, int(starts[j]), plens[j], hidden, 0
++                            )
++                            + rb
++                            + bytes((-len(rb)) % 8)
++                        )
++                        self.ring.write(
++                            K_CHUNK,
++                            [
++                                np.frombuffer(hdr, dtype=np.uint8),
++                                tok[off : off + v].view(np.uint8).reshape(-1),
++                                aux[off : off + v].reshape(-1).view(np.uint8),
++                            ],
++                        )
++                    off += q
++                self.free.put(i)
++                now = time.time()
++                if now - self._t_log > 30:
++                    self._t_log = now
++                    self.log(
++                        f"[live-tap] steps={self.steps} records={self.ring.records} "
++                        f"MB={self.ring.nbytes / 2**20:.0f} "
++                        f"dropped_steps={self.dropped} queue={self.q.qsize()}"
++                    )
++            except Exception as e:
++                self.log(f"[live-tap] writer error: {e!r}")
++                with contextlib.suppress(Exception):
++                    self.free.put(it[1])
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index df7dc96..b4f4746 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -188,6 +188,7 @@ from vllm.v1.spec_decode.draft_model import DraftModelProposer
+ from vllm.v1.spec_decode.eagle import EagleProposer
+ from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+ from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
++from vllm.v1.spec_decode.live_tap import LiveTap
+ from vllm.v1.spec_decode.medusa import MedusaProposer
+ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+ from vllm.v1.spec_decode.ngram_proposer_gpu import (
+@@ -695,6 +696,8 @@ class GPUModelRunner(
+ 
+         # Request states.
+         self.requests: dict[str, CachedRequestState] = {}
++        # Live training-data tap: None unless VLLM_SPEC_LIVE_TAP is set.
++        self.live_tap: LiveTap | None = LiveTap.from_env(self, log=logger.info)
+         # NOTE(rob): num_prompt_logprobs only includes reqs
+         # that are currently in the prefill phase.
+         self.num_prompt_logprobs: dict[str, int] = {}
+@@ -1202,6 +1205,8 @@ class GPUModelRunner(
+             req_state = self.requests.pop(req_id, None)
+             self._on_request_state_removed(req_id, req_state)
+             self.num_prompt_logprobs.pop(req_id, None)
++        if self.live_tap is not None and scheduler_output.finished_req_ids:
++            self.live_tap.finish(scheduler_output.finished_req_ids)
+         self.late_interaction_runner.on_requests_finished(
+             scheduler_output.finished_req_ids
+         )
+@@ -5190,6 +5195,23 @@ class GPUModelRunner(
+                     else:
+                         target_hidden_states = hidden_states[:total_num_tokens]
+ 
++            if self.live_tap is not None:
++                compacted = (
++                    spec_decode_metadata is not None
++                    and spec_config.disable_padded_drafter_batch
++                )
++                self.live_tap.record(
++                    scheduler_output,
++                    self.input_batch,
++                    self.requests,
++                    target_token_ids,
++                    target_hidden_states,
++                    num_rejected_tokens_gpu,
++                    spec_decode_metadata.num_draft_tokens
++                    if spec_decode_metadata is not None
++                    else None,
++                    common_attn_metadata.query_start_loc_cpu if compacted else None,
++                )
+             if self.supports_mm_inputs and self.drafter.supports_mm_inputs:
+                 mm_embed_inputs = self._gather_mm_embeddings(
+                     scheduler_output,
+-- 
+2.51.0
+
+
+From 5b880ee7a45f482d30af168cbaec0ec0a76b0f16 Mon Sep 17 00:00:00 2001
+From: Tony Wen <jwen2914@uni.sydney.edu.au>
+Date: Thu, 8 Oct 2026 16:59:18 +1100
+Subject: [PATCH 2/9] [Spec Decode] Add an e2e test for the live training-data
+ tap
+
+Serve 12 chat prompts with an EAGLE-3 drafter (padded and unpadded
+drafter batches) and reconstruct every request's token sequence from the
+ring: chunks must be contiguous, carry 3 x hidden_size aux states, match
+prompt + generated tokens, and end with a FINISH marker.
+
+Co-authored-by: Claude <noreply@anthropic.com>
+Signed-off-by: Tony Wen <jwen2914@uni.sydney.edu.au>
+---
+ .../v1/e2e/spec_decode/eagle/test_live_tap.py | 75 +++++++++++++++++++
+ 1 file changed, 75 insertions(+)
+ create mode 100644 tests/v1/e2e/spec_decode/eagle/test_live_tap.py
+
+diff --git a/tests/v1/e2e/spec_decode/eagle/test_live_tap.py b/tests/v1/e2e/spec_decode/eagle/test_live_tap.py
+new file mode 100644
+index 0000000..26794b4
+--- /dev/null
++++ b/tests/v1/e2e/spec_decode/eagle/test_live_tap.py
+@@ -0,0 +1,75 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""End-to-end check of the live training-data tap: every committed token of every
++request must be reconstructable from the ring, in order, with hidden states of
++the drafter's aux width."""
++
++import os
++
++import numpy as np
++import pytest
++
++from vllm import LLM, SamplingParams
++from vllm.v1.spec_decode.live_tap import (
++    K_CHUNK,
++    K_FINISH,
++    K_GAP,
++    Ring,
++    decode_chunk,
++    decode_id,
++)
++
++from ..utils import get_test_prompts
++
++MODEL = os.environ.get("VLLM_TEST_TARGET", "Qwen/Qwen3-8B")
++DRAFT = os.environ.get("VLLM_TEST_DRAFT", "AngelSlim/Qwen3-8B_eagle3")
++
++
++@pytest.mark.parametrize("padded_batch", [True, False])
++def test_live_tap_reconstructs_committed_tokens(tmp_path, monkeypatch, padded_batch):
++    tap = str(tmp_path / "tap")
++    monkeypatch.setenv("VLLM_SPEC_LIVE_TAP", tap)
++    monkeypatch.setenv("VLLM_SPEC_LIVE_TAP_GB", "0.5")
++    llm = LLM(
++        model=MODEL,
++        speculative_config={
++            "method": "eagle3",
++            "model": DRAFT,
++            "num_speculative_tokens": 3,
++            "disable_padded_drafter_batch": not padded_batch,
++        },
++        max_model_len=2048,
++        enable_prefix_caching=False,
++        gpu_memory_utilization=0.8,
++        seed=0,
++    )
++    prompts = get_test_prompts(mm_enabled=False)[:12]
++    outputs = llm.chat(prompts, SamplingParams(temperature=0, max_tokens=64))
++    expected = {
++        o.request_id: list(o.prompt_token_ids) + list(o.outputs[0].token_ids)
++        for o in outputs
++    }
++    hidden = llm.llm_engine.model_config.get_hidden_size() * 3
++
++    reader = Ring(tap)
++    reader.rewind_to_oldest()
++    seqs: dict[str, list[np.ndarray]] = {}
++    finished: set[str] = set()
++    for kind, payload in reader.read(max_records=1_000_000):
++        if kind == K_CHUNK:
++            rid, n, start, _plen, hid, tok, aux = decode_chunk(payload)
++            assert hid == hidden
++            assert aux.shape == (n, hidden)
++            got = seqs.setdefault(rid, [])
++            assert start == sum(len(c) for c in got), (rid, start)
++            got.append(tok.copy())
++        elif kind == K_FINISH:
++            finished.add(decode_id(payload))
++        else:
++            assert kind != K_GAP, "a step was dropped"
++    assert finished == set(expected)
++    for rid, full in expected.items():
++        got = np.concatenate(seqs[rid]).tolist()
++        # the last sampled tokens (bonus + EOS) never get a hidden state
++        assert len(got) >= len(full) - 4
++        assert got == full[: len(got)], rid
+-- 
+2.51.0
+
+
+From cd045c8a3c9c63d3950f85d39d4f65acd2ccd2a2 Mon Sep 17 00:00:00 2001
+From: Tony Wen <jwen2914@uni.sydney.edu.au>
+Date: Thu, 8 Oct 2026 19:02:04 +1100
+Subject: [PATCH 3/9] [Spec Decode] Fix a hang in the live-tap unit test
+
+queue.Queue.join() waits for task_done() calls the writer thread never
+makes; the test already polls the ring with a deadline, so drop the join.
+
+Co-authored-by: Claude <noreply@anthropic.com>
+Signed-off-by: Tony Wen <jwen2914@uni.sydney.edu.au>
+---
+ tests/v1/worker/test_live_tap.py | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/tests/v1/worker/test_live_tap.py b/tests/v1/worker/test_live_tap.py
+index 51b091a..9b7eb65 100644
+--- a/tests/v1/worker/test_live_tap.py
++++ b/tests/v1/worker/test_live_tap.py
+@@ -127,7 +127,6 @@ def test_record_exports_committed_positions(tmp_path):
+         num_draft_tokens=[3, 0],
+     )
+     tap.finish(["A"])
+-    tap.q.join() if hasattr(tap.q, "join") else None
+     reader = Ring(path)
+     reader.rewind_to_oldest()
+     deadline = 50
+-- 
+2.51.0
+
+
+From a594186835f0cf2c28e19bc3f3836ac132bf9326 Mon Sep 17 00:00:00 2001
+From: Tony Wen <jwen2914@uni.sydney.edu.au>
+Date: Thu, 8 Oct 2026 19:08:10 +1100
+Subject: [PATCH 4/9] [Spec Decode] Run the live-tap e2e on the V1 model runner
+
+The tap hooks live in GPUModelRunner (V1); pin VLLM_USE_V2_MODEL_RUNNER=0
+in the e2e and say so in the docs until the V2 runner is covered.
+
+Co-authored-by: Claude <noreply@anthropic.com>
+Signed-off-by: Tony Wen <jwen2914@uni.sydney.edu.au>
+---
+ docs/features/speculative_decoding/eagle.md     | 2 ++
+ tests/v1/e2e/spec_decode/eagle/test_live_tap.py | 2 ++
+ 2 files changed, 4 insertions(+)
+
+diff --git a/docs/features/speculative_decoding/eagle.md b/docs/features/speculative_decoding/eagle.md
+index a840592..c16ff95 100644
+--- a/docs/features/speculative_decoding/eagle.md
++++ b/docs/features/speculative_decoding/eagle.md
+@@ -90,6 +90,8 @@ vllm serve Qwen/Qwen3-8B --no-enable-prefix-caching \
+   throughput. Only tensor-parallel rank 0 writes.
+ * Prefix caching must be disabled: positions served from the prefix cache have no
+   hidden state to export.
++* The tap is implemented in the V1 GPU model runner; set
++  `VLLM_USE_V2_MODEL_RUNNER=0` where the V2 runner would be selected by default.
+ 
+ The record format is documented in `vllm/v1/spec_decode/live_tap.py`; `Ring` in
+ the same module is the reader side.
+diff --git a/tests/v1/e2e/spec_decode/eagle/test_live_tap.py b/tests/v1/e2e/spec_decode/eagle/test_live_tap.py
+index 26794b4..1b5216c 100644
+--- a/tests/v1/e2e/spec_decode/eagle/test_live_tap.py
++++ b/tests/v1/e2e/spec_decode/eagle/test_live_tap.py
+@@ -30,6 +30,8 @@ def test_live_tap_reconstructs_committed_tokens(tmp_path, monkeypatch, padded_ba
+     tap = str(tmp_path / "tap")
+     monkeypatch.setenv("VLLM_SPEC_LIVE_TAP", tap)
+     monkeypatch.setenv("VLLM_SPEC_LIVE_TAP_GB", "0.5")
++    # the tap lives in the V1 GPU model runner (the V2 runner port is pending)
++    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+     llm = LLM(
+         model=MODEL,
+         speculative_config={
+-- 
+2.51.0
+
+
+From 906fb5ef73210e6aa6e7e1d65ed24860d17e96af Mon Sep 17 00:00:00 2001
+From: Tony Wen <jwen2914@uni.sydney.edu.au>
+Date: Thu, 8 Oct 2026 19:19:25 +1100
+Subject: [PATCH 5/9] [Spec Decode] Match engine-suffixed request ids in the
+ live-tap e2e
+
+The engine core appends a unique suffix to request ids; the tap records
+the internal id, so map it back to the id the LLM API returned.
+
+Co-authored-by: Claude <noreply@anthropic.com>
+Signed-off-by: Tony Wen <jwen2914@uni.sydney.edu.au>
+---
+ tests/v1/e2e/spec_decode/eagle/test_live_tap.py | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/tests/v1/e2e/spec_decode/eagle/test_live_tap.py b/tests/v1/e2e/spec_decode/eagle/test_live_tap.py
+index 1b5216c..4632715 100644
+--- a/tests/v1/e2e/spec_decode/eagle/test_live_tap.py
++++ b/tests/v1/e2e/spec_decode/eagle/test_live_tap.py
+@@ -53,6 +53,10 @@ def test_live_tap_reconstructs_committed_tokens(tmp_path, monkeypatch, padded_ba
+     }
+     hidden = llm.llm_engine.model_config.get_hidden_size() * 3
+ 
++    def external_id(rid: str) -> str:
++        # the engine core suffixes request ids ("<id>-<hex>") to keep them unique
++        return rid if rid in expected else rid.rsplit("-", 1)[0]
++
+     reader = Ring(tap)
+     reader.rewind_to_oldest()
+     seqs: dict[str, list[np.ndarray]] = {}
+@@ -62,11 +66,11 @@ def test_live_tap_reconstructs_committed_tokens(tmp_path, monkeypatch, padded_ba
+             rid, n, start, _plen, hid, tok, aux = decode_chunk(payload)
+             assert hid == hidden
+             assert aux.shape == (n, hidden)
+-            got = seqs.setdefault(rid, [])
++            got = seqs.setdefault(external_id(rid), [])
+             assert start == sum(len(c) for c in got), (rid, start)
+             got.append(tok.copy())
+         elif kind == K_FINISH:
+-            finished.add(decode_id(payload))
++            finished.add(external_id(decode_id(payload)))
+         else:
+             assert kind != K_GAP, "a step was dropped"
+     assert finished == set(expected)
+-- 
+2.51.0
+
+
+From b6f947606395d1a776b2bff4b213e7a4898bce7e Mon Sep 17 00:00:00 2001
+From: Tony Wen <jwen2914@uni.sydney.edu.au>
+Date: Thu, 8 Oct 2026 19:32:56 +1100
+Subject: [PATCH 6/9] [Spec Decode] Flush the last FINISH markers in the
+ live-tap e2e
+
+Finished request ids reach the runner at the next scheduler step, so the
+requests that end in the final step get their FINISH record only when the
+engine runs again; the e2e now issues one more one-token request before
+reading the ring, and the record layout docstring says so.
+
+Co-authored-by: Claude <noreply@anthropic.com>
+Signed-off-by: Tony Wen <jwen2914@uni.sydney.edu.au>
+---
+ tests/v1/e2e/spec_decode/eagle/test_live_tap.py | 10 ++++++++--
+ vllm/v1/spec_decode/live_tap.py                 |  3 ++-
+ 2 files changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/tests/v1/e2e/spec_decode/eagle/test_live_tap.py b/tests/v1/e2e/spec_decode/eagle/test_live_tap.py
+index 4632715..4f08f9f 100644
+--- a/tests/v1/e2e/spec_decode/eagle/test_live_tap.py
++++ b/tests/v1/e2e/spec_decode/eagle/test_live_tap.py
+@@ -51,11 +51,17 @@ def test_live_tap_reconstructs_committed_tokens(tmp_path, monkeypatch, padded_ba
+         o.request_id: list(o.prompt_token_ids) + list(o.outputs[0].token_ids)
+         for o in outputs
+     }
++    # FINISH markers are written when the runner learns of finished requests, i.e.
++    # at the next scheduler step: run one more tiny request so the last ones flush
++    flush = llm.generate(["flush"], SamplingParams(temperature=0, max_tokens=1))
++    flushed_ids = {o.request_id for o in flush}
+     hidden = llm.llm_engine.model_config.get_hidden_size() * 3
+ 
+     def external_id(rid: str) -> str:
+         # the engine core suffixes request ids ("<id>-<hex>") to keep them unique
+-        return rid if rid in expected else rid.rsplit("-", 1)[0]
++        if rid in expected or rid in flushed_ids:
++            return rid
++        return rid.rsplit("-", 1)[0]
+ 
+     reader = Ring(tap)
+     reader.rewind_to_oldest()
+@@ -73,7 +79,7 @@ def test_live_tap_reconstructs_committed_tokens(tmp_path, monkeypatch, padded_ba
+             finished.add(external_id(decode_id(payload)))
+         else:
+             assert kind != K_GAP, "a step was dropped"
+-    assert finished == set(expected)
++    assert finished - flushed_ids == set(expected)
+     for rid, full in expected.items():
+         got = np.concatenate(seqs[rid]).tolist()
+         # the last sampled tokens (bonus + EOS) never get a hidden state
+diff --git a/vllm/v1/spec_decode/live_tap.py b/vllm/v1/spec_decode/live_tap.py
+index adf86d4..a72e434 100644
+--- a/vllm/v1/spec_decode/live_tap.py
++++ b/vllm/v1/spec_decode/live_tap.py
+@@ -17,7 +17,8 @@ File layout (default /dev/shm):
+              u32 flags, req_id (padded to 8), int32 tokens[n],
+              int16 aux[n * hidden] (bf16 bit patterns); the rows cover
+              positions start_pos .. start_pos + n - 1 of the request
+-    FINISH : u32 id_len, u32 pad, req_id   -- the request is complete
++    FINISH : u32 id_len, u32 pad, req_id   -- the request is complete (written
++             when the runner learns of it, i.e. at the next scheduler step)
+     GAP    : same as FINISH                -- a step was dropped: discard it
+ `seq` is a logical byte offset that only grows; `oldest_seq` is the start of
+ the oldest intact record, so a reader that falls behind it has been lapped and
+-- 
+2.51.0
+
+
+From 5f8b5a84769eb15f20c0422df8b5184235cc792d Mon Sep 17 00:00:00 2001
+From: Tony Wen <jwen2914@uni.sydney.edu.au>
+Date: Thu, 8 Oct 2026 19:50:11 +1100
+Subject: [PATCH 7/9] [Spec Decode] Report the first mismatching position in
+ the live-tap e2e
+
+Co-authored-by: Claude <noreply@anthropic.com>
+Signed-off-by: Tony Wen <jwen2914@uni.sydney.edu.au>
+---
+ tests/v1/e2e/spec_decode/eagle/test_live_tap.py | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/tests/v1/e2e/spec_decode/eagle/test_live_tap.py b/tests/v1/e2e/spec_decode/eagle/test_live_tap.py
+index 4f08f9f..687acc0 100644
+--- a/tests/v1/e2e/spec_decode/eagle/test_live_tap.py
++++ b/tests/v1/e2e/spec_decode/eagle/test_live_tap.py
+@@ -81,7 +81,17 @@ def test_live_tap_reconstructs_committed_tokens(tmp_path, monkeypatch, padded_ba
+             assert kind != K_GAP, "a step was dropped"
+     assert finished - flushed_ids == set(expected)
+     for rid, full in expected.items():
+-        got = np.concatenate(seqs[rid]).tolist()
++        chunks = seqs[rid]
++        got = np.concatenate(chunks).tolist()
+         # the last sampled tokens (bonus + EOS) never get a hidden state
+-        assert len(got) >= len(full) - 4
+-        assert got == full[: len(got)], rid
++        assert len(got) >= len(full) - 4, (rid, len(got), len(full))
++        if got != full[: len(got)]:
++            i = next(k for k, (x, y) in enumerate(zip(got, full)) if x != y)
++            bounds = np.cumsum([len(c) for c in chunks]).tolist()
++            pytest.fail(
++                f"request {rid}: first mismatch at position {i} of {len(got)} "
++                f"(prompt {len(outputs[0].prompt_token_ids)} tokens); chunk sizes "
++                f"{[len(c) for c in chunks]} boundaries {bounds}; "
++                f"tap {got[max(0, i - 4) : i + 6]} "
++                f"vs expected {full[max(0, i - 4) : i + 6]}"
++            )
+-- 
+2.51.0
+
+
+From 49f3d9ed8a87dda94108376789498b552a6c4a46 Mon Sep 17 00:00:00 2001
+From: Tony Wen <jwen2914@uni.sydney.edu.au>
+Date: Thu, 8 Oct 2026 20:03:51 +1100
+Subject: [PATCH 8/9] [Spec Decode] Allow accepted drafts past the truncated
+ output in the tap e2e
+
+In the final step of a request the verifier may accept drafts beyond EOS
+or max_tokens; the engine truncates the output but those positions were
+committed target-forward positions and the tap exports them.
+
+Co-authored-by: Claude <noreply@anthropic.com>
+Signed-off-by: Tony Wen <jwen2914@uni.sydney.edu.au>
+---
+ tests/v1/e2e/spec_decode/eagle/test_live_tap.py | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/tests/v1/e2e/spec_decode/eagle/test_live_tap.py b/tests/v1/e2e/spec_decode/eagle/test_live_tap.py
+index 687acc0..9e90ff2 100644
+--- a/tests/v1/e2e/spec_decode/eagle/test_live_tap.py
++++ b/tests/v1/e2e/spec_decode/eagle/test_live_tap.py
+@@ -83,9 +83,17 @@ def test_live_tap_reconstructs_committed_tokens(tmp_path, monkeypatch, padded_ba
+     for rid, full in expected.items():
+         chunks = seqs[rid]
+         got = np.concatenate(chunks).tolist()
+-        # the last sampled tokens (bonus + EOS) never get a hidden state
+-        assert len(got) >= len(full) - 4, (rid, len(got), len(full))
+-        if got != full[: len(got)]:
++        # The last sampled tokens (bonus + EOS) never get a hidden state, and
++        # drafts the verifier accepted in the final step past EOS / max_tokens
++        # are exported although the request's output was truncated before them.
++        k = 3
++        assert len(full) - 4 <= len(got) <= len(full) + k + 1, (
++            rid,
++            len(got),
++            len(full),
++        )
++        n = min(len(got), len(full))
++        if got[:n] != full[:n]:
+             i = next(k for k, (x, y) in enumerate(zip(got, full)) if x != y)
+             bounds = np.cumsum([len(c) for c in chunks]).tolist()
+             pytest.fail(
+-- 
+2.51.0
+
+
+From ddab4c4095212255e55d0c2a06f744ad87ff30e2 Mon Sep 17 00:00:00 2001
+From: Tony Wen <jwen2914@uni.sydney.edu.au>
+Date: Thu, 8 Oct 2026 21:59:06 +1100
+Subject: [PATCH 9/9] [Spec Decode] Add a runtime speculation switch
+ (set_speculation)
+
+`collective_rpc("set_speculation", kwargs={"enabled": "0"|"1"})` switches
+speculative decoding off and on at runtime without restarting the engine.
+The switch has two halves kept in step by EngineCore.collective_rpc:
+the scheduler stops scheduling speculative-token slots (so decoding is a
+plain one token per step, instead of padded draft slots that would all be
+rejected), and the GPU model runner stops proposing drafts (the drafter
+and its weights stay loaded; the live tap keeps exporting the target's
+committed tokens and aux hidden states). Switching back on takes effect
+at the next scheduler step. Lets a controller apply the load-dependent
+speculation frontier at runtime instead of a static per-batch-size table.
+
+Co-authored-by: Claude <noreply@anthropic.com>
+Signed-off-by: Tony Wen <jwen2914@uni.sydney.edu.au>
+---
+ .../spec_decode/eagle/test_set_speculation.py | 53 +++++++++++++++++++
+ vllm/v1/core/sched/scheduler.py               | 14 ++++-
+ vllm/v1/engine/core.py                        |  7 +++
+ vllm/v1/worker/gpu_model_runner.py            | 48 +++++++++++++++++
+ vllm/v1/worker/gpu_worker.py                  |  3 ++
+ 5 files changed, 123 insertions(+), 2 deletions(-)
+ create mode 100644 tests/v1/e2e/spec_decode/eagle/test_set_speculation.py
+
+diff --git a/tests/v1/e2e/spec_decode/eagle/test_set_speculation.py b/tests/v1/e2e/spec_decode/eagle/test_set_speculation.py
+new file mode 100644
+index 0000000..a8aabdd
+--- /dev/null
++++ b/tests/v1/e2e/spec_decode/eagle/test_set_speculation.py
+@@ -0,0 +1,53 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Runtime speculation switch: switching off must stop drafting without changing
++outputs; switching back on must resume drafting."""
++
++import os
++
++from vllm import LLM, SamplingParams
++
++from ..utils import get_test_prompts
++
++MODEL = os.environ.get("VLLM_TEST_TARGET", "Qwen/Qwen3-8B")
++DRAFT = os.environ.get("VLLM_TEST_DRAFT", "AngelSlim/Qwen3-8B_eagle3")
++
++
++def _drafts(llm: LLM) -> float:
++    total = 0.0
++    for metric in llm.get_metrics():
++        if metric.name == "vllm:spec_decode_num_drafts":
++            total += float(getattr(metric, "value", 0.0))
++    return total
++
++
++def test_set_speculation_is_lossless_and_stops_drafting(monkeypatch):
++    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
++    llm = LLM(
++        model=MODEL,
++        speculative_config={
++            "method": "eagle3",
++            "model": DRAFT,
++            "num_speculative_tokens": 3,
++        },
++        max_model_len=2048,
++        gpu_memory_utilization=0.8,
++        seed=0,
++        disable_log_stats=False,
++    )
++    prompts = get_test_prompts(mm_enabled=False)[:8]
++    params = SamplingParams(temperature=0, max_tokens=48)
++
++    on = [o.outputs[0].token_ids for o in llm.chat(prompts, params)]
++    drafts_on = _drafts(llm)
++    assert drafts_on > 0
++
++    llm.collective_rpc("set_speculation", kwargs={"enabled": "0"})
++    off = [o.outputs[0].token_ids for o in llm.chat(prompts, params)]
++    assert _drafts(llm) == drafts_on, "drafts were proposed while speculation was off"
++    assert off == on, "switching speculation off changed the outputs"
++
++    llm.collective_rpc("set_speculation", kwargs={"enabled": "1"})
++    again = [o.outputs[0].token_ids for o in llm.chat(prompts, params)]
++    assert _drafts(llm) > drafts_on, "drafting did not resume"
++    assert again == on
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index e25b5ad..7b2a166 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -280,6 +280,9 @@ class Scheduler(SchedulerInterface):
+         self.use_eagle = False
+         self.use_eagle_block_drop = False
+         self.num_spec_tokens = vllm_config.num_speculative_tokens
++        # Runtime speculation switch (set_speculation): False -> no draft slots are
++        # scheduled, i.e. plain one-token-per-step decoding until switched back on.
++        self.spec_enabled = True
+         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
+         # DSV41 SWA bounded replay: groups that declare a replay window are rebuilt
+         # after a prefix hit by recomputing its trailing tokens. One window
+@@ -1098,7 +1101,10 @@ class Scheduler(SchedulerInterface):
+                     # preserve full cudagraph for this step.
+                     # Not for diffusion where draft tokens can't be padded.
+                     if (
+-                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
++                        self.spec_enabled
++                        and (
++                            self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None
++                        )
+                         and self.num_sampled_tokens_per_step > 0
+                         and num_new_tokens == 1
+                         and not prefill_scheduled
+@@ -1449,7 +1455,7 @@ class Scheduler(SchedulerInterface):
+         pending_kv_cache_block_copies = kv_cache_block_copies or None
+ 
+         # Dynamic speculative decoding: compute optimal K
+-        num_spec_tokens_to_schedule = self.num_spec_tokens
++        num_spec_tokens_to_schedule = self.num_spec_tokens if self.spec_enabled else 0
+         if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
+             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
+                 len(num_scheduled_tokens)
+@@ -2957,6 +2963,10 @@ class Scheduler(SchedulerInterface):
+     # KV Connector Related Methods
+     ########################################################################
+ 
++    def set_speculation(self, enabled: bool) -> None:
++        """Runtime switch: off = schedule no speculative tokens (plain decoding)."""
++        self.spec_enabled = bool(enabled)
++
+     def get_kv_connector(self) -> KVConnectorBase_V1 | None:
+         return self.connector
+ 
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index cc0a8be..021465c 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -1037,6 +1037,13 @@ class EngineCore:
+         args: tuple = (),
+         kwargs: dict[str, Any] | None = None,
+     ) -> list[_R]:
++        if method == "set_speculation":
++            # The switch has a scheduler half (stop scheduling draft slots) and a
++            # worker half (stop proposing); keep both in step.
++            enabled = (kwargs or {}).get("enabled", args[0] if args else "1")
++            self.scheduler.set_speculation(
++                str(enabled).lower() in ("1", "true", "on", "yes")
++            )
+         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
+ 
+     def set_weight_version(self, weight_version: str) -> None:
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index b4f4746..19b617c 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -698,6 +698,8 @@ class GPUModelRunner(
+         self.requests: dict[str, CachedRequestState] = {}
+         # Live training-data tap: None unless VLLM_SPEC_LIVE_TAP is set.
+         self.live_tap: LiveTap | None = LiveTap.from_env(self, log=logger.info)
++        # Runtime speculation switch (set_speculation): False -> no drafts are proposed.
++        self.spec_enabled = True
+         # NOTE(rob): num_prompt_logprobs only includes reqs
+         # that are currently in the prefill phase.
+         self.num_prompt_logprobs: dict[str, int] = {}
+@@ -4576,6 +4578,46 @@ class GPUModelRunner(
+                 self._copy_draft_token_ids_to_cpu(scheduler_output)
+ 
+         spec_config = self.speculative_config
++        if spec_config is not None and not self.spec_enabled:
++            # Speculation switched off at runtime: propose no drafts (the
++            # scheduler then decodes plainly). Keep the live tap fed from the
++            # target's outputs, only for steps without drafts (all positions committed).
++            if (
++                self.live_tap is not None
++                and aux_hidden_states is not None
++                and spec_decode_metadata is None
++            ):
++                n = scheduler_output.total_num_scheduled_tokens
++                self.live_tap.record(
++                    scheduler_output,
++                    self.input_batch,
++                    self.requests,
++                    self.input_ids.gpu[:n],
++                    torch.cat([h[:n] for h in aux_hidden_states], dim=-1),
++                )
++            # Same bookkeeping as when the input does not fit in the drafter: the
++            # valid sampled-token counts of this (possibly drafted) batch are still
++            # needed, only the proposal is skipped.
++            if (
++                spec_config.use_eagle()
++                or spec_config.uses_draft_model()
++                or spec_config.uses_extract_hidden_states()
++            ) and not spec_config.disable_padded_drafter_batch:
++                next_token_ids, valid_sampled_tokens_count = (
++                    self.drafter.prepare_next_token_ids_padded(
++                        sampler_output.sampled_token_ids,
++                        self.requests,
++                        self.input_batch,
++                        self.discard_request_mask.gpu,
++                    )
++                )
++                self._copy_valid_sampled_token_count(
++                    next_token_ids, valid_sampled_tokens_count
++                )
++                # The bookkeeping expects the next token per request to be cached
++                # when the batch carried drafts (propose_draft_token_ids does it).
++                self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
++            spec_config = None
+         draft_after_bookkeeping = False
+         if spec_config is not None:
+             # Decide whether to run the drafter or zero out draft tokens.
+@@ -5497,6 +5539,12 @@ class GPUModelRunner(
+ 
+         return None
+ 
++    def set_speculation(self, enabled="1") -> None:
++        """Runtime switch for speculative decoding. Off: no drafts are proposed and the
++        scheduler decodes one token per step; the drafter stays loaded."""
++        self.spec_enabled = str(enabled).lower() in ("1", "true", "on", "yes")
++        logger.info("speculation %s", "enabled" if self.spec_enabled else "disabled")
++
+     def reload_weights(
+         self,
+         weights_iterator: Iterable[tuple[str, torch.Tensor]] | None = None,
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index f9b5883..6495211 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -592,6 +592,9 @@ class Worker(WorkerBase):
+     def update_config(self, overrides: dict[str, Any]) -> None:
+         self.model_runner.update_config(overrides)
+ 
++    def set_speculation(self, *args, **kwargs) -> None:
++        self.model_runner.set_speculation(*args, **kwargs)
++
+     def reload_weights(self, *args, **kwargs) -> None:
+         with set_current_vllm_config(self.vllm_config):
+             self.model_runner.reload_weights(*args, **kwargs)
+-- 
+2.51.0
+

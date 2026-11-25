@@ -1,0 +1,452 @@
+From d9f8e150410236185defac7814c1c10c924e5132 Mon Sep 17 00:00:00 2001
+From: Tony Wen <jwen2914@uni.sydney.edu.au>
+Date: Tue, 6 Oct 2026 09:12:14 +1100
+Subject: [PATCH] [Spec Decode] Add reload_draft_weights to hot-swap an updated
+ draft model
+
+Reload the speculative draft model's weights in place from a new
+checkpoint through a worker RPC, so a drafter trained online can be
+swapped into a running engine without a restart. Submodules the draft
+shares with the target (EAGLE embedding, MTP lm_head) are detached while
+the checkpoint loads so target storage is never written.
+
+Co-authored-by: Claude <noreply@anthropic.com>
+Signed-off-by: Tony Wen <jwen2914@uni.sydney.edu.au>
+---
+ docs/features/speculative_decoding/eagle.md   |  23 ++++
+ .../eagle/test_reload_draft_weights.py        | 100 +++++++++++++++++
+ tests/v1/worker/test_gpu_model_runner.py      | 106 +++++++++++++++++-
+ vllm/v1/worker/gpu/model_runner.py            |   5 +
+ vllm/v1/worker/gpu_model_runner.py            | 104 +++++++++++++++++
+ vllm/v1/worker/gpu_worker.py                  |   4 +
+ 6 files changed, 341 insertions(+), 1 deletion(-)
+ create mode 100644 tests/v1/e2e/spec_decode/eagle/test_reload_draft_weights.py
+
+diff --git a/docs/features/speculative_decoding/eagle.md b/docs/features/speculative_decoding/eagle.md
+index cc9e4fd..bcec7da 100644
+--- a/docs/features/speculative_decoding/eagle.md
++++ b/docs/features/speculative_decoding/eagle.md
+@@ -56,6 +56,29 @@ for output in outputs:
+     print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+ ```
+ 
++## Reloading an Updated Draft Model
++
++A draft model that keeps training while vLLM serves (for example on the live
++request stream) can be swapped into the running engine without a restart and
++without touching the target model, by calling `reload_draft_weights` on the
++workers. With the offline API:
++
++```python
++llm.collective_rpc("reload_draft_weights", kwargs={"weights_path": "/path/to/new-draft"})
++```
++
++With an online server started with `VLLM_SERVER_DEV_MODE=1`:
++
++```bash
++curl -X POST http://localhost:8000/collective_rpc \
++    -H "Content-Type: application/json" \
++    -d '{"method": "reload_draft_weights", "kwargs": {"weights_path": "/path/to/new-draft"}}'
++```
++
++The new checkpoint must have the same architecture as the configured draft
++model; omitting `weights_path` reloads from the configured path. Submodules the
++drafter shares with the target model (such as the embedding) are left untouched.
++
+ ## Pre-Trained Eagle Draft Models
+ 
+ A variety of EAGLE draft models are available on the Hugging Face hub:
+diff --git a/tests/v1/e2e/spec_decode/eagle/test_reload_draft_weights.py b/tests/v1/e2e/spec_decode/eagle/test_reload_draft_weights.py
+new file mode 100644
+index 0000000..04b326a
+--- /dev/null
++++ b/tests/v1/e2e/spec_decode/eagle/test_reload_draft_weights.py
+@@ -0,0 +1,100 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Swap draft weights in a running engine: outputs stay those of the target
++(verification is lossless) while the acceptance length tracks the draft quality."""
++
++import shutil
++from pathlib import Path
++
++import pytest
++import torch
++from huggingface_hub import snapshot_download
++from safetensors.torch import load_file, save_file
++
++from vllm import LLM, SamplingParams
++
++from ..utils import get_test_prompts
++
++
++def _spec_decode_counters(llm: LLM) -> dict[str, float]:
++    counters: dict[str, float] = {}
++    for metric in llm.get_metrics():
++        if "spec_decode" in metric.name and hasattr(metric, "value"):
++            counters[metric.name] = counters.get(metric.name, 0.0) + metric.value
++    return counters
++
++
++def _mean_acceptance_length(llm: LLM, prompts, sampling_params) -> tuple[float, list]:
++    before = _spec_decode_counters(llm)
++    outputs = llm.chat(prompts, sampling_params)
++    after = _spec_decode_counters(llm)
++    delta = {k: after.get(k, 0.0) - before.get(k, 0.0) for k in after}
++    drafts = sum(v for k, v in delta.items() if k.endswith("spec_decode_num_drafts"))
++    accepted = sum(
++        v for k, v in delta.items() if k.endswith("spec_decode_num_accepted_tokens")
++    )
++    assert drafts > 0
++    return 1.0 + accepted / drafts, [o.outputs[0].token_ids for o in outputs]
++
++
++def _degraded_draft_checkpoint(draft_model: str, out_dir: Path) -> Path:
++    """Copy the draft checkpoint with its lm_head zeroed (the drafter then proposes
++    the same token everywhere, so almost nothing is accepted)."""
++    src = Path(snapshot_download(draft_model))
++    out_dir.mkdir(parents=True, exist_ok=True)
++    for name in ("config.json", "generation_config.json"):
++        if (src / name).exists():
++            shutil.copy(src / name, out_dir / name)
++    tensors: dict[str, torch.Tensor] = {}
++    for f in sorted(src.glob("*.safetensors")):
++        tensors.update(load_file(str(f)))
++    for f in sorted(src.glob("*.bin")):
++        tensors.update(torch.load(str(f), map_location="cpu", weights_only=True))
++    head_keys = [k for k in tensors if k.endswith("lm_head.weight")]
++    assert head_keys, f"no lm_head in {draft_model}: {list(tensors)[:5]}"
++    for k in head_keys:
++        tensors[k] = torch.zeros_like(tensors[k])
++    save_file(
++        {k: v.contiguous() for k, v in tensors.items()},
++        str(out_dir / "model.safetensors"),
++        metadata={"format": "pt"},
++    )
++    return out_dir
++
++
++@pytest.mark.parametrize(
++    ("model_name", "draft_model"),
++    [
++        ("Qwen/Qwen3-8B", "AngelSlim/Qwen3-8B_eagle3"),
++        ("meta-llama/Llama-3.1-8B-Instruct", "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"),
++    ],
++    ids=["qwen3_eagle3", "llama3_eagle3"],
++)
++def test_reload_draft_weights(tmp_path: Path, model_name: str, draft_model: str):
++    prompts = get_test_prompts(mm_enabled=False)[:16]
++    sampling_params = SamplingParams(temperature=0, max_tokens=64)
++    llm = LLM(
++        model=model_name,
++        speculative_config={
++            "method": "eagle3",
++            "model": draft_model,
++            "num_speculative_tokens": 3,
++            "max_model_len": 2048,
++        },
++        max_model_len=2048,
++        gpu_memory_utilization=0.8,
++        disable_log_stats=False,
++    )
++    acc_original, ref_outputs = _mean_acceptance_length(llm, prompts, sampling_params)
++    assert acc_original > 1.5
++
++    degraded = _degraded_draft_checkpoint(draft_model, tmp_path / "degraded")
++    llm.collective_rpc("reload_draft_weights", kwargs={"weights_path": str(degraded)})
++    acc_degraded, outputs = _mean_acceptance_length(llm, prompts, sampling_params)
++    assert outputs == ref_outputs, "reloading the draft changed target outputs"
++    assert acc_degraded < acc_original - 0.5
++
++    llm.collective_rpc("reload_draft_weights", kwargs={"weights_path": draft_model})
++    acc_restored, outputs = _mean_acceptance_length(llm, prompts, sampling_params)
++    assert outputs == ref_outputs
++    assert abs(acc_restored - acc_original) < 0.1
+diff --git a/tests/v1/worker/test_gpu_model_runner.py b/tests/v1/worker/test_gpu_model_runner.py
+index 5cf5389..2de9ab5 100644
+--- a/tests/v1/worker/test_gpu_model_runner.py
++++ b/tests/v1/worker/test_gpu_model_runner.py
+@@ -4,11 +4,12 @@
+ import gc
+ from contextlib import nullcontext
+ from types import SimpleNamespace
+-from unittest.mock import Mock
++from unittest.mock import Mock, patch
+ 
+ import numpy as np
+ import pytest
+ import torch
++import torch.nn as nn
+ 
+ import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
+ from vllm.config import (
+@@ -61,6 +62,7 @@ from vllm.v1.worker.block_table import (
+ from vllm.v1.worker.gpu.lora_utils import LoraState
+ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+ from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
++from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
+ from vllm.v1.worker.gpu_input_batch import InputBatch
+ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+ from vllm.v1.worker.utils import select_common_block_size
+@@ -1959,3 +1961,105 @@ def test_mamba_cache_raises_when_max_num_seqs_exceeds_blocks():
+ 
+         with pytest.raises(ValueError, match="max_num_seqs"):
+             runner.initialize_kv_cache(kv_cache_config)
++
++
++class TestReloadDraftWeights:
++    """reload_draft_weights swaps a newly trained draft into a running engine."""
++
++    def _make_runner(self, cls=GPUModelRunner, draft_load_config=None):
++        runner = object.__new__(cls)
++        runner.load_config = Mock()
++        runner.load_config.load_format = "safetensors"
++        runner.speculative_config = SimpleNamespace(
++            draft_model_config=SimpleNamespace(model="draft/original", revision="v1"),
++            draft_load_config=draft_load_config,
++        )
++        runner.get_model = Mock(return_value=Mock())
++        return runner
++
++    def _reload(self, runner, draft_model, weights, **kwargs):
++        loader = Mock()
++        loader.get_all_weights.return_value = weights
++        runner.get_draft_model = Mock(return_value=draft_model)
++        with (
++            patch.object(
++                gpu_model_runner_module, "get_model_loader", return_value=loader
++            ) as get_loader,
++            patch.object(
++                gpu_model_runner_module, "initialize_layerwise_reload"
++            ) as initialize_reload,
++            patch.object(
++                gpu_model_runner_module, "finalize_layerwise_reload"
++            ) as finalize_reload,
++        ):
++            runner.reload_draft_weights(**kwargs)
++        return loader, get_loader, initialize_reload, finalize_reload
++
++    def test_reload_from_new_path_loads_only_the_draft(self):
++        runner = self._make_runner()
++        draft_model = Mock()
++        weights = iter([("fc.weight", torch.zeros(1))])
++
++        loader, get_loader, initialize_reload, finalize_reload = self._reload(
++            runner, draft_model, weights, weights_path="draft/updated"
++        )
++
++        draft_config = runner.speculative_config.draft_model_config
++        assert draft_config.model == "draft/updated"
++        assert draft_config.revision is None
++        get_loader.assert_called_once_with(runner.load_config)
++        loader.get_all_weights.assert_called_once_with(draft_config, draft_model)
++        draft_model.load_weights.assert_called_once_with(weights)
++        runner.get_model.return_value.load_weights.assert_not_called()
++        initialize_reload.assert_called_once_with(draft_model)
++        finalize_reload.assert_called_once_with(draft_model, draft_config)
++
++    def test_reload_without_draft_model_raises(self):
++        runner = self._make_runner()
++        runner.get_draft_model = Mock(return_value=None)
++
++        with pytest.raises(ValueError, match="No speculative draft model"):
++            runner.reload_draft_weights(weights_path="draft/updated")
++
++    def test_v2_runner_delegates_to_v1(self):
++        runner = self._make_runner(GPUModelRunnerV2)
++        draft_model = Mock()
++
++        self._reload(runner, draft_model, iter([]), weights_path="draft/updated")
++
++        draft_model.load_weights.assert_called_once()
++        assert runner.speculative_config.draft_model_config.model == "draft/updated"
++
++    def test_reload_never_writes_target_owned_submodules(self):
++        """A draft checkpoint that ships the shared embedding must not touch the
++        target's embedding, and the shared module must be re-attached after."""
++
++        class _TinyDraft(nn.Module):
++            def __init__(self, embed_tokens: nn.Module):
++                super().__init__()
++                self.embed_tokens = embed_tokens
++                self.fc = nn.Linear(4, 4, bias=False)
++
++            def load_weights(self, weights):
++                from vllm.model_executor.models.utils import AutoWeightsLoader
++
++                return AutoWeightsLoader(self).load_weights(weights)
++
++        target_model = nn.Module()
++        target_model.embed_tokens = nn.Embedding(8, 4)
++        original_embed = target_model.embed_tokens.weight.detach().clone()
++        draft_model = _TinyDraft(target_model.embed_tokens)
++        runner = self._make_runner()
++        runner.get_model = Mock(return_value=target_model)
++        weights = iter(
++            [
++                ("embed_tokens.weight", torch.full((8, 4), 7.0)),
++                ("fc.weight", torch.eye(4)),
++            ]
++        )
++
++        self._reload(runner, draft_model, weights, weights_path="draft/updated")
++
++        assert draft_model.embed_tokens is target_model.embed_tokens
++        assert torch.equal(target_model.embed_tokens.weight, original_embed)
++        assert torch.equal(draft_model.fc.weight, torch.eye(4))
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index b42289e..1382b4b 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -554,6 +554,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+         GPUModelRunnerV1.reload_weights(self, *args, **kwargs)  # type: ignore[arg-type]
+ 
++    def reload_draft_weights(self, *args, **kwargs) -> None:
++        from vllm.v1.worker.gpu_model_runner import GPUModelRunner as GPUModelRunnerV1
++
++        GPUModelRunnerV1.reload_draft_weights(self, *args, **kwargs)  # type: ignore[arg-type]
++
+     def update_config(self, *args, **kwargs) -> None:
+         # TODO(Wentao): Use full version instead of import when fully migrated to v2
+         from vllm.v1.worker.gpu_model_runner import GPUModelRunner as GPUModelRunnerV1
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index df7dc96..e105c72 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -476,6 +476,45 @@ class ExecuteModelState(NamedTuple):
+     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+ 
+ 
++class _DiscardWeights(nn.Module):
++    """Swallows checkpoint tensors aimed at a draft submodule owned by the target."""
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        for _ in weights:
++            pass
++        return set()
++
++
++@contextmanager
++def _detach_target_owned_draft_modules(
++    draft_model: nn.Module, target_model: nn.Module
++) -> Iterator[None]:
++    """Unbind draft submodules that are live target objects while draft weights
++    load, so a draft checkpoint can never overwrite target storage (EAGLE drafters
++    share the target embedding; MTP drafters alias the target lm_head)."""
++    if not isinstance(draft_model, nn.Module) or not isinstance(
++        target_model, nn.Module
++    ):
++        yield
++        return
++    target_ids = {id(module) for module in target_model.modules()}
++    detached: list[tuple[nn.Module, str, nn.Module]] = []
++    for name, module in draft_model.named_modules(remove_duplicate=False):
++        if not name or id(module) not in target_ids:
++            continue
++        parent_name, _, attr = name.rpartition(".")
++        parent = draft_model.get_submodule(parent_name) if parent_name else draft_model
++        if id(parent) not in target_ids:
++            detached.append((parent, attr, module))
++    for parent, attr, _ in detached:
++        setattr(parent, attr, _DiscardWeights())
++    try:
++        yield
++    finally:
++        for parent, attr, module in detached:
++            setattr(parent, attr, module)
++
++
+ class GPUModelRunner(
+     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
+ ):
+@@ -5565,6 +5604,71 @@ class GPUModelRunner(
+         self.reset_encoder_cache()
+         self.reset_mm_cache()
+ 
++    def reload_draft_weights(
++        self,
++        weights_iterator: Iterable[tuple[str, torch.Tensor]] | None = None,
++        weights_path: str | None = None,
++    ) -> None:
++        """Reload the speculative draft model's weights in place.
++
++        Lets a draft model that keeps training while the engine serves (e.g. on
++        the live request stream) be swapped in without restarting the engine or
++        touching the target model: draft submodules that are live target objects
++        (the embedding shared by EAGLE drafters, the lm_head aliased by MTP
++        drafters) are detached while the checkpoint is loaded.
++
++        Args:
++            weights_iterator: weights to load into the draft model.
++            weights_path: checkpoint to load from when ``weights_iterator`` is
++                not given. Defaults to the draft model's configured path.
++
++        Raises:
++            ValueError: if no speculative draft model is loaded.
++
++        """
++        get_draft_model = getattr(self, "get_draft_model", None)
++        draft_model = get_draft_model() if callable(get_draft_model) else None
++        if draft_model is None or self.speculative_config is None:
++            raise ValueError("No speculative draft model is loaded")
++        draft_model_config = self.speculative_config.draft_model_config
++        assert draft_model_config is not None
++
++        if weights_path is not None:
++            draft_model_config.model = weights_path
++            draft_model_config.revision = None
++        if weights_iterator is None:
++            load_config = self.speculative_config.draft_load_config or self.load_config
++            model_loader = get_model_loader(load_config)
++            if not hasattr(model_loader, "get_all_weights"):
++                raise NotImplementedError(
++                    f"Draft model reloading with `{load_config.load_format}` format"
++                )
++            weights_iterator = cast(
++                Iterable[tuple[str, torch.Tensor]],
++                model_loader.get_all_weights(draft_model_config, draft_model),
++            )
++
++        logger.info("Reloading draft model weights in place...")
++        counter_before_reloading = time.perf_counter()
++        with _detach_target_owned_draft_modules(draft_model, self.get_model()):
++            initialize_layerwise_reload(draft_model)
++            draft_model.load_weights(weights_iterator)
++            finalize_layerwise_reload(draft_model, draft_model_config)
++        # Drafters that derive fused buffers from their layer weights at the end
++        # of load_weights (dflash) rebuilt them on meta tensors inside the
++        # layerwise lifecycle; rebuild once more now that the real ones are back.
++        rebuild_fused_state = getattr(
++            getattr(draft_model, "model", None) or draft_model,
++            "_build_fused_kv_buffers",
++            None,
++        )
++        if callable(rebuild_fused_state):
++            rebuild_fused_state()
++        logger.info(
++            "Reloading draft model weights took %.2f seconds",
++            time.perf_counter() - counter_before_reloading,
++        )
++
+     def _get_prompt_logprobs_dict(
+         self,
+         hidden_states: torch.Tensor,
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index f9b5883..5e61449 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -596,6 +596,10 @@ class Worker(WorkerBase):
+         with set_current_vllm_config(self.vllm_config):
+             self.model_runner.reload_weights(*args, **kwargs)
+ 
++    def reload_draft_weights(self, *args, **kwargs) -> None:
++        with set_current_vllm_config(self.vllm_config):
++            self.model_runner.reload_draft_weights(*args, **kwargs)
++
+     @torch.inference_mode()
+     def determine_available_memory(self) -> int:
+         """Profiles the peak memory usage of the model to determine how much
+-- 
+2.51.0
+
